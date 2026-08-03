@@ -96,6 +96,26 @@ def apply_metric_divider(df: pd.DataFrame, metrics: list[str], divider_metric: s
     return ratio_df
 
 
+def apply_increment_metric_divider(
+    df: pd.DataFrame,
+    metrics: list[str],
+    divider_metric: str | None,
+) -> pd.DataFrame:
+    if divider_metric is None or divider_metric not in df.columns:
+        return df
+
+    ratio_df = df.copy().sort_values(["ep_id", "captured_at"])
+    denominator = pd.to_numeric(ratio_df[divider_metric], errors="coerce")
+    denominator_delta = denominator.groupby(ratio_df["ep_id"]).diff().clip(lower=0)
+    denominator_delta = denominator_delta.where(denominator_delta != 0)
+    for metric in metrics:
+        if metric in ratio_df.columns:
+            numerator = pd.to_numeric(ratio_df[metric], errors="coerce")
+            numerator_delta = numerator.groupby(ratio_df["ep_id"]).diff().clip(lower=0)
+            ratio_df[metric] = numerator_delta / denominator_delta
+    return ratio_df
+
+
 def to_beijing_time(value: Any) -> Any:
     if pd.isna(value):
         return value
@@ -268,7 +288,10 @@ def build_chart_df(
 
     labels = latest_df.set_index("ep_id").apply(format_time_series_episode_label, axis=1).to_dict()
     created_at_by_ep_id = latest_df.set_index("ep_id")["created_at"].to_dict()
-    value_df = apply_metric_divider(series_df, metrics, divider_metric)
+    if value_mode == DELTA_VALUE_LABEL and divider_metric is not None:
+        value_df = apply_increment_metric_divider(series_df, metrics, divider_metric)
+    else:
+        value_df = apply_metric_divider(series_df, metrics, divider_metric)
     chart_df = value_df.melt(
         id_vars=["captured_at", "ep_id"],
         value_vars=metrics,
@@ -279,8 +302,9 @@ def build_chart_df(
     chart_df["metric"] = chart_df["metric"].apply(lambda metric: format_metric_label(metric, divider_metric))
     chart_df["captured_at"] = pd.to_datetime(chart_df["captured_at"], utc=True).dt.tz_convert(BEIJING_TZ)
     if value_mode == DELTA_VALUE_LABEL:
-        chart_df = chart_df.sort_values(["ep_id", "metric", "captured_at"])
-        chart_df["value"] = chart_df.groupby(["ep_id", "metric"])["value"].diff()
+        if divider_metric is None:
+            chart_df = chart_df.sort_values(["ep_id", "metric", "captured_at"])
+            chart_df["value"] = chart_df.groupby(["ep_id", "metric"])["value"].diff()
         chart_df = chart_df.dropna(subset=["value"])
     if time_axis_mode == RELATIVE_TO_CREATION_LABEL:
         chart_df["created_at"] = chart_df["ep_id"].map(created_at_by_ep_id)
@@ -514,7 +538,7 @@ def render_dashboard() -> None:
         x_axis = "days_since_created"
         x_axis_label = "发布后天数"
     if value_mode == DELTA_VALUE_LABEL:
-        y_axis_label = "较上次采集的比值变化" if divider_metric else "较上次采集变化"
+        y_axis_label = "较上次采集的增量比值" if divider_metric else "较上次采集变化"
 
     fig = px.line(
         chart_df,
