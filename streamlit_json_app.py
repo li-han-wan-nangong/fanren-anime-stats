@@ -72,6 +72,7 @@ DAILY_AGGREGATION_LABEL = "每日"
 WEEKLY_AGGREGATION_LABEL = "每周"
 TOTAL_SERIES_LABEL = "全部剧集合计"
 TOTAL_EPISODE_ID = "__total__"
+HAS_PREVIOUS_POINT_COLUMN = "_has_previous_point"
 
 
 def format_metric_label(metric: str, divider_metric: str | None) -> str:
@@ -114,6 +115,32 @@ def apply_increment_metric_divider(
             numerator_delta = numerator.groupby(ratio_df["ep_id"]).diff().clip(lower=0)
             ratio_df[metric] = numerator_delta / denominator_delta
     return ratio_df
+
+
+def infer_collection_interval(df: pd.DataFrame) -> pd.Timedelta | None:
+    sorted_df = df.copy().sort_values(["ep_id", "captured_at"])
+    captured_at = pd.to_datetime(sorted_df["captured_at"], utc=True)
+    capture_diffs = captured_at.groupby(sorted_df["ep_id"]).diff().dropna()
+    if capture_diffs.empty:
+        return None
+    return capture_diffs.median()
+
+
+def add_has_previous_point_column(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    marked_df = df.copy().sort_values(["ep_id", "captured_at"])
+    captured_at = pd.to_datetime(marked_df["captured_at"], utc=True)
+    episode_previous_capture_at = captured_at.groupby(marked_df["ep_id"]).shift()
+    collection_interval = infer_collection_interval(marked_df)
+    if collection_interval is None:
+        marked_df[HAS_PREVIOUS_POINT_COLUMN] = False
+        return marked_df
+
+    elapsed_since_previous = captured_at - episode_previous_capture_at
+    marked_df[HAS_PREVIOUS_POINT_COLUMN] = elapsed_since_previous.le(collection_interval * 1.5)
+    return marked_df
 
 
 def to_beijing_time(value: Any) -> Any:
@@ -326,6 +353,7 @@ def build_chart_df(
     time_axis_mode: str,
     value_mode: str,
     divider_metric: str | None,
+    require_previous_point_for_delta: bool = False,
 ) -> pd.DataFrame:
     if series_df.empty:
         return series_df
@@ -336,8 +364,13 @@ def build_chart_df(
         value_df = apply_increment_metric_divider(series_df, metrics, divider_metric)
     else:
         value_df = apply_metric_divider(series_df, metrics, divider_metric)
+        if value_mode == DELTA_VALUE_LABEL and require_previous_point_for_delta:
+            value_df = add_has_previous_point_column(value_df)
+    id_vars = ["captured_at", "ep_id"]
+    if HAS_PREVIOUS_POINT_COLUMN in value_df.columns:
+        id_vars.append(HAS_PREVIOUS_POINT_COLUMN)
     chart_df = value_df.melt(
-        id_vars=["captured_at", "ep_id"],
+        id_vars=id_vars,
         value_vars=metrics,
         var_name="metric",
         value_name="value",
@@ -349,6 +382,8 @@ def build_chart_df(
         if divider_metric is None:
             chart_df = chart_df.sort_values(["ep_id", "metric", "captured_at"])
             chart_df["value"] = chart_df.groupby(["ep_id", "metric"])["value"].diff()
+            if HAS_PREVIOUS_POINT_COLUMN in chart_df.columns:
+                chart_df = chart_df[chart_df[HAS_PREVIOUS_POINT_COLUMN]]
         chart_df = chart_df.dropna(subset=["value"])
     if time_axis_mode == RELATIVE_TO_CREATION_LABEL:
         chart_df["created_at"] = chart_df["ep_id"].map(created_at_by_ep_id)
@@ -594,7 +629,15 @@ def render_dashboard() -> None:
             ]
         )
         chart_latest_df = pd.concat([target_latest_df, total_latest_df], ignore_index=True)
-    chart_df = build_chart_df(series_df, chart_latest_df, selected_metrics, time_axis_mode, value_mode, divider_metric)
+    chart_df = build_chart_df(
+        series_df,
+        chart_latest_df,
+        selected_metrics,
+        time_axis_mode,
+        value_mode,
+        divider_metric,
+        require_previous_point_for_delta=bool(selected_ep_ids),
+    )
     if chart_df.empty:
         st.warning("在所选剧集和时间范围内没有找到采集记录。")
         return
