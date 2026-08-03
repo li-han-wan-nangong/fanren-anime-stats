@@ -436,13 +436,13 @@ def render_dashboard() -> None:
             "时间范围",
             (ALL_TIME_LABEL, LAST_24_HOURS_LABEL, LAST_7_DAYS_LABEL, LAST_30_DAYS_LABEL, LAST_90_DAYS_LABEL),
         )
-        time_axis_mode = st.radio(
-            "时间序列横轴",
-            (CAPTURE_TIME_LABEL, RELATIVE_TO_CREATION_LABEL),
-        )
         aggregation_scale = st.selectbox(
             "时间序列聚合",
             (HOURLY_AGGREGATION_LABEL, DAILY_AGGREGATION_LABEL, WEEKLY_AGGREGATION_LABEL),
+        )
+        time_axis_mode = st.radio(
+            "时间序列横轴",
+            (CAPTURE_TIME_LABEL, RELATIVE_TO_CREATION_LABEL),
         )
         value_mode = st.radio(
             "时间序列数值",
