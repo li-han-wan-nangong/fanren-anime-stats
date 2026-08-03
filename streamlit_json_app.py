@@ -16,14 +16,10 @@ BEIJING_TZ = "Asia/Shanghai"
 PREVIEW_DURATION_CUTOFF_MS = 10 * 60 * 1000
 ENGAGEMENT_FIELDS = ("view", "like", "coin", "favorite", "share", "reply", "dm")
 TABLE_COLUMNS = [
-    "ep_id",
-    "playlist_index",
     "episode_title",
     "long_title",
     "season",
     "duration",
-    "created_at",
-    "latest_captured_at",
     "view",
     "like",
     "coin",
@@ -31,8 +27,7 @@ TABLE_COLUMNS = [
     "share",
     "reply",
     "dm",
-    "url",
-    "cover",
+    "created_at",
 ]
 ENGAGEMENT_LABELS = {
     "view": "播放",
@@ -72,6 +67,11 @@ CAPTURE_TIME_LABEL = "采集时间"
 RELATIVE_TO_CREATION_LABEL = "相对发布时间"
 ABSOLUTE_VALUE_LABEL = "累计值"
 DELTA_VALUE_LABEL = "较上次采集变化"
+HOURLY_AGGREGATION_LABEL = "每小时"
+DAILY_AGGREGATION_LABEL = "每日"
+WEEKLY_AGGREGATION_LABEL = "每周"
+TOTAL_SERIES_LABEL = "全部剧集合计"
+TOTAL_EPISODE_ID = "__total__"
 
 
 def format_metric_label(metric: str, divider_metric: str | None) -> str:
@@ -93,6 +93,26 @@ def apply_metric_divider(df: pd.DataFrame, metrics: list[str], divider_metric: s
         if metric in ratio_df.columns:
             numerator = pd.to_numeric(ratio_df[metric], errors="coerce")
             ratio_df[metric] = numerator / denominator
+    return ratio_df
+
+
+def apply_increment_metric_divider(
+    df: pd.DataFrame,
+    metrics: list[str],
+    divider_metric: str | None,
+) -> pd.DataFrame:
+    if divider_metric is None or divider_metric not in df.columns:
+        return df
+
+    ratio_df = df.copy().sort_values(["ep_id", "captured_at"])
+    denominator = pd.to_numeric(ratio_df[divider_metric], errors="coerce")
+    denominator_delta = denominator.groupby(ratio_df["ep_id"]).diff().clip(lower=0)
+    denominator_delta = denominator_delta.where(denominator_delta != 0)
+    for metric in metrics:
+        if metric in ratio_df.columns:
+            numerator = pd.to_numeric(ratio_df[metric], errors="coerce")
+            numerator_delta = numerator.groupby(ratio_df["ep_id"]).diff().clip(lower=0)
+            ratio_df[metric] = numerator_delta / denominator_delta
     return ratio_df
 
 
@@ -233,6 +253,48 @@ def load_time_series(data_dir: str, ep_ids: list[int], since: datetime | None) -
     return pd.DataFrame(rows)
 
 
+def aggregate_time_series(series_df: pd.DataFrame, aggregation_scale: str) -> pd.DataFrame:
+    if series_df.empty or aggregation_scale == HOURLY_AGGREGATION_LABEL:
+        return series_df
+
+    aggregated_df = series_df.copy()
+    captured_at = pd.to_datetime(aggregated_df["captured_at"], utc=True)
+    beijing_captured_at = captured_at.dt.tz_convert(BEIJING_TZ)
+    if aggregation_scale == DAILY_AGGREGATION_LABEL:
+        bucket_start = beijing_captured_at.dt.floor("D")
+    elif aggregation_scale == WEEKLY_AGGREGATION_LABEL:
+        day_start = beijing_captured_at.dt.floor("D")
+        days_since_saturday = (day_start.dt.weekday - 5) % 7
+        bucket_start = day_start - pd.to_timedelta(days_since_saturday, unit="D")
+    else:
+        return series_df
+
+    aggregated_df["_bucket_start"] = bucket_start
+    aggregated_df["_captured_at_sort"] = captured_at
+    latest_indexes = aggregated_df.groupby(["ep_id", "_bucket_start"])["_captured_at_sort"].idxmax()
+    aggregated_df = aggregated_df.loc[latest_indexes].copy()
+    aggregated_df["captured_at"] = aggregated_df["_bucket_start"]
+    return (
+        aggregated_df.drop(columns=["_bucket_start", "_captured_at_sort"])
+        .sort_values(["ep_id", "captured_at"])
+        .reset_index(drop=True)
+    )
+
+
+def aggregate_total_time_series(series_df: pd.DataFrame) -> pd.DataFrame:
+    if series_df.empty:
+        return series_df
+
+    total_df = series_df.copy()
+    for field in ENGAGEMENT_FIELDS:
+        if field in total_df.columns:
+            total_df[field] = pd.to_numeric(total_df[field], errors="coerce")
+
+    total_df = total_df.groupby("captured_at", as_index=False)[list(ENGAGEMENT_FIELDS)].sum(min_count=1)
+    total_df["ep_id"] = TOTAL_EPISODE_ID
+    return total_df.sort_values("captured_at").reset_index(drop=True)
+
+
 def format_episode_label(row: pd.Series) -> str:
     title = row.get("long_title") or row.get("episode_title") or ""
     playlist_index = row.get("playlist_index")
@@ -246,6 +308,8 @@ def format_time_series_episode_label(row: pd.Series) -> str:
     episode_title = row.get("episode_title")
     long_title = row.get("long_title")
     if pd.notna(episode_title) and pd.notna(long_title):
+        if str(episode_title) == str(long_title):
+            return str(episode_title)
         return f"{episode_title} | {long_title}"
     if pd.notna(long_title):
         return str(long_title)
@@ -268,7 +332,10 @@ def build_chart_df(
 
     labels = latest_df.set_index("ep_id").apply(format_time_series_episode_label, axis=1).to_dict()
     created_at_by_ep_id = latest_df.set_index("ep_id")["created_at"].to_dict()
-    value_df = apply_metric_divider(series_df, metrics, divider_metric)
+    if value_mode == DELTA_VALUE_LABEL and divider_metric is not None:
+        value_df = apply_increment_metric_divider(series_df, metrics, divider_metric)
+    else:
+        value_df = apply_metric_divider(series_df, metrics, divider_metric)
     chart_df = value_df.melt(
         id_vars=["captured_at", "ep_id"],
         value_vars=metrics,
@@ -279,8 +346,9 @@ def build_chart_df(
     chart_df["metric"] = chart_df["metric"].apply(lambda metric: format_metric_label(metric, divider_metric))
     chart_df["captured_at"] = pd.to_datetime(chart_df["captured_at"], utc=True).dt.tz_convert(BEIJING_TZ)
     if value_mode == DELTA_VALUE_LABEL:
-        chart_df = chart_df.sort_values(["ep_id", "metric", "captured_at"])
-        chart_df["value"] = chart_df.groupby(["ep_id", "metric"])["value"].diff()
+        if divider_metric is None:
+            chart_df = chart_df.sort_values(["ep_id", "metric", "captured_at"])
+            chart_df["value"] = chart_df.groupby(["ep_id", "metric"])["value"].diff()
         chart_df = chart_df.dropna(subset=["value"])
     if time_axis_mode == RELATIVE_TO_CREATION_LABEL:
         chart_df["created_at"] = chart_df["ep_id"].map(created_at_by_ep_id)
@@ -381,6 +449,11 @@ def render_dashboard() -> None:
             "时间范围",
             (ALL_TIME_LABEL, LAST_24_HOURS_LABEL, LAST_7_DAYS_LABEL, LAST_30_DAYS_LABEL, LAST_90_DAYS_LABEL),
         )
+        st.header("时间序列")
+        aggregation_scale = st.selectbox(
+            "时间序列聚合",
+            (HOURLY_AGGREGATION_LABEL, DAILY_AGGREGATION_LABEL, WEEKLY_AGGREGATION_LABEL),
+        )
         time_axis_mode = st.radio(
             "时间序列横轴",
             (CAPTURE_TIME_LABEL, RELATIVE_TO_CREATION_LABEL),
@@ -454,7 +527,10 @@ def render_dashboard() -> None:
         },
         key="episodes_grid",
     )
-    selected_ep_ids = edited_df.loc[edited_df["选择"], "ep_id"].dropna().astype(int).tolist()
+    selected_ep_ids = filtered_df.loc[edited_df["选择"], "ep_id"].dropna().astype(int).tolist()
+    filtered_ep_ids = filtered_df["ep_id"].dropna().astype(int).tolist()
+    target_ep_ids = selected_ep_ids or filtered_ep_ids
+    target_latest_df = filtered_df[filtered_df["ep_id"].isin(target_ep_ids)].copy()
 
     st.subheader("各剧集最新互动数据")
     overview_chart_df = build_latest_engagement_df(filtered_df, selected_metrics, divider_metric)
@@ -486,8 +562,8 @@ def render_dashboard() -> None:
         st.plotly_chart(overview_fig, use_container_width=True)
 
     st.subheader("互动数据时间序列")
-    if not selected_ep_ids:
-        st.info("请在表格中选择一个或多个剧集来绘制时间序列。")
+    if not target_ep_ids:
+        st.info("没有可绘制的剧集。")
         return
     if not selected_metrics:
         st.info("请在侧边栏至少选择一个互动指标。")
@@ -501,8 +577,24 @@ def render_dashboard() -> None:
         LAST_30_DAYS_LABEL: now - timedelta(days=30),
         LAST_90_DAYS_LABEL: now - timedelta(days=90),
     }
-    series_df = load_time_series(data_dir, selected_ep_ids, since_by_window[time_window])
-    chart_df = build_chart_df(series_df, filtered_df, selected_metrics, time_axis_mode, value_mode, divider_metric)
+    series_df = load_time_series(data_dir, target_ep_ids, since_by_window[time_window])
+    series_df = aggregate_time_series(series_df, aggregation_scale)
+    chart_latest_df = target_latest_df
+    if not selected_ep_ids:
+        series_df = aggregate_total_time_series(series_df)
+        created_at = target_latest_df["created_at"].min() if not target_latest_df.empty else None
+        total_latest_df = pd.DataFrame(
+            [
+                {
+                    "ep_id": TOTAL_EPISODE_ID,
+                    "episode_title": TOTAL_SERIES_LABEL,
+                    "long_title": TOTAL_SERIES_LABEL,
+                    "created_at": created_at,
+                }
+            ]
+        )
+        chart_latest_df = pd.concat([target_latest_df, total_latest_df], ignore_index=True)
+    chart_df = build_chart_df(series_df, chart_latest_df, selected_metrics, time_axis_mode, value_mode, divider_metric)
     if chart_df.empty:
         st.warning("在所选剧集和时间范围内没有找到采集记录。")
         return
@@ -514,7 +606,7 @@ def render_dashboard() -> None:
         x_axis = "days_since_created"
         x_axis_label = "发布后天数"
     if value_mode == DELTA_VALUE_LABEL:
-        y_axis_label = "较上次采集的比值变化" if divider_metric else "较上次采集变化"
+        y_axis_label = "较上次采集的增量比值" if divider_metric else "较上次采集变化"
 
     fig = px.line(
         chart_df,
