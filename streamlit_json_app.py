@@ -72,6 +72,9 @@ CAPTURE_TIME_LABEL = "采集时间"
 RELATIVE_TO_CREATION_LABEL = "相对发布时间"
 ABSOLUTE_VALUE_LABEL = "累计值"
 DELTA_VALUE_LABEL = "较上次采集变化"
+HOURLY_AGGREGATION_LABEL = "每小时"
+DAILY_AGGREGATION_LABEL = "每日"
+WEEKLY_AGGREGATION_LABEL = "每周"
 
 
 def format_metric_label(metric: str, divider_metric: str | None) -> str:
@@ -253,6 +256,34 @@ def load_time_series(data_dir: str, ep_ids: list[int], since: datetime | None) -
     return pd.DataFrame(rows)
 
 
+def aggregate_time_series(series_df: pd.DataFrame, aggregation_scale: str) -> pd.DataFrame:
+    if series_df.empty or aggregation_scale == HOURLY_AGGREGATION_LABEL:
+        return series_df
+
+    aggregated_df = series_df.copy()
+    captured_at = pd.to_datetime(aggregated_df["captured_at"], utc=True)
+    beijing_captured_at = captured_at.dt.tz_convert(BEIJING_TZ)
+    if aggregation_scale == DAILY_AGGREGATION_LABEL:
+        bucket_start = beijing_captured_at.dt.floor("D")
+    elif aggregation_scale == WEEKLY_AGGREGATION_LABEL:
+        day_start = beijing_captured_at.dt.floor("D")
+        days_since_saturday = (day_start.dt.weekday - 5) % 7
+        bucket_start = day_start - pd.to_timedelta(days_since_saturday, unit="D")
+    else:
+        return series_df
+
+    aggregated_df["_bucket_start"] = bucket_start
+    aggregated_df["_captured_at_sort"] = captured_at
+    latest_indexes = aggregated_df.groupby(["ep_id", "_bucket_start"])["_captured_at_sort"].idxmax()
+    aggregated_df = aggregated_df.loc[latest_indexes].copy()
+    aggregated_df["captured_at"] = aggregated_df["_bucket_start"]
+    return (
+        aggregated_df.drop(columns=["_bucket_start", "_captured_at_sort"])
+        .sort_values(["ep_id", "captured_at"])
+        .reset_index(drop=True)
+    )
+
+
 def format_episode_label(row: pd.Series) -> str:
     title = row.get("long_title") or row.get("episode_title") or ""
     playlist_index = row.get("playlist_index")
@@ -409,6 +440,10 @@ def render_dashboard() -> None:
             "时间序列横轴",
             (CAPTURE_TIME_LABEL, RELATIVE_TO_CREATION_LABEL),
         )
+        aggregation_scale = st.selectbox(
+            "时间序列聚合",
+            (HOURLY_AGGREGATION_LABEL, DAILY_AGGREGATION_LABEL, WEEKLY_AGGREGATION_LABEL),
+        )
         value_mode = st.radio(
             "时间序列数值",
             (ABSOLUTE_VALUE_LABEL, DELTA_VALUE_LABEL),
@@ -526,6 +561,7 @@ def render_dashboard() -> None:
         LAST_90_DAYS_LABEL: now - timedelta(days=90),
     }
     series_df = load_time_series(data_dir, selected_ep_ids, since_by_window[time_window])
+    series_df = aggregate_time_series(series_df, aggregation_scale)
     chart_df = build_chart_df(series_df, filtered_df, selected_metrics, time_axis_mode, value_mode, divider_metric)
     if chart_df.empty:
         st.warning("在所选剧集和时间范围内没有找到采集记录。")
